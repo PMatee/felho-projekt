@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="hu">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Phishing-elemző</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.3/css/bootstrap.min.css">
+</head>
+<body class="bg-light">
+<div class="container py-4" style="max-width: 960px;">
+  <h1 class="h3 mb-4">Phishing-elemző</h1>
+
+  <div class="card mb-4">
+    <div class="card-header fw-semibold">E-mail feltöltése</div>
+    <div class="card-body">
+      <label for="file" class="form-label">Válassz ki egy .eml fájlt (max. 200 KB). A feltöltés után az elemzés automatikusan elindul.</label>
+      <input class="form-control" type="file" id="file" accept=".eml,message/rfc822">
+      <div id="status" class="mt-3" role="status" aria-live="polite"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-header d-flex justify-content-between align-items-center">
+      <span class="fw-semibold">Korábbi elemzések</span>
+      <button id="refresh" type="button" class="btn btn-outline-secondary btn-sm">Frissítés</button>
+    </div>
+    <div class="table-responsive">
+      <table class="table table-hover align-middle mb-0">
+        <thead>
+          <tr><th>Időpont</th><th>Feladó</th><th>Tárgy</th><th>Pontszám</th><th>Kockázat</th></tr>
+        </thead>
+        <tbody id="history"><tr><td colspan="5" class="text-muted">Betöltés…</td></tr></tbody>
+      </table>
+    </div>
+    <div class="card-footer text-muted small">Egy sorra kattintva megjelennek a felismert gyanús jellemzők.</div>
+  </div>
+</div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const BADGE = { "alacsony": "text-bg-success", "közepes": "text-bg-warning", "magas": "text-bg-danger" };
+const detailsCache = new Map();
+
+/* ------------------------------------------------------------- DOM segéd */
+function el(tag, cls, ...children) {
+  const node = document.createElement(tag);
+  if (cls) node.className = cls;
+  for (const c of children) if (c != null) node.append(c);   // mindig szövegként (nincs HTML-injekció)
+  return node;
+}
+
+function showStatus(kind, ...parts) {        // kind: success | warning | danger | info
+  const box = el("div", "alert alert-" + kind + " mb-0");
+  for (const p of parts) box.append(p);
+  $("status").replaceChildren(box);
+}
+
+/* ------------------------------------------------------------------ API */
+async function callApi(path, options) {
+  let res;
+  try { res = await fetch(path, options); }
+  catch (e) { const err = new Error("A szerver nem érhető el."); err.network = true; throw err; }
+  let data = null;
+  try { data = await res.json(); } catch (e) { /* nem JSON */ }
+  if (!res.ok) {
+    const err = new Error((data && data.error) || "Hiba a szerver oldalon (HTTP " + res.status + ").");
+    err.status = res.status;
+    err.data = data;
+    throw err;
+  }
+  return data;
+}
+
+/* -------------------------------------------------------- .eml feldolgozás */
+function decodeBytes(bytes, charset) {
+  try { return new TextDecoder(charset || "utf-8").decode(bytes); }
+  catch (e) { return new TextDecoder("utf-8").decode(bytes); }
+}
+function qpBytes(text, headerMode) {
+  const s = headerMode ? text.replace(/_/g, " ") : text.replace(/=\r?\n/g, "");
+  const out = [];
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === "=" && /^[0-9a-fA-F]{2}$/.test(s.substr(i + 1, 2))) { out.push(parseInt(s.substr(i + 1, 2), 16)); i += 2; }
+    else out.push(...new TextEncoder().encode(c));
+  }
+  return new Uint8Array(out);
+}
+function b64Bytes(text) {
+  const bin = atob(text.replace(/\s+/g, ""));
+  return Uint8Array.from(bin, (ch) => ch.charCodeAt(0));
+}
+function decodeWords(s) {
+  if (!s) return "";
+  return s.replace(/\?=\s+=\?/g, "?==?").replace(/=\?([^?]+)\?([bBqQ])\?([^?]*)\?=/g, (m, cs, enc, txt) => {
+    try { return decodeBytes(enc.toLowerCase() === "b" ? b64Bytes(txt) : qpBytes(txt, true), cs); }
+    catch (e) { return m; }
+  });
+}
+function splitMessage(raw) {
+  const m = raw.match(/\r?\n\r?\n/);
+  const head = m ? raw.slice(0, m.index) : raw;
+  const body = m ? raw.slice(m.index + m[0].length) : "";
+  const headers = {};
+  for (const line of head.replace(/\r?\n[ \t]+/g, " ").split(/\r?\n/)) {
+    const i = line.indexOf(":");
+    if (i > 0) (headers[line.slice(0, i).trim().toLowerCase()] ||= []).push(line.slice(i + 1).trim());
+  }
+  return { headers, body };
+}
+function paramOf(value, name) {
+  const star = new RegExp(name + "\\*=(?:[^']*)'[^']*'([^;]+)", "i").exec(value || "");
+  if (star) { try { return decodeURIComponent(star[1].trim().replace(/^"|"$/g, "")); } catch (e) { /* tovább */ } }
+  const m = new RegExp(name + '="?([^";]+)"?', "i").exec(value || "");
+  return m ? decodeWords(m[1].trim()) : "";
+}
+function walkMime(raw, acc) {
+  const { headers, body } = splitMessage(raw);
+  const ct = (headers["content-type"] || ["text/plain"])[0];
+  const type = ct.split(";")[0].trim().toLowerCase();
+  if (type.startsWith("multipart/")) {
+    const boundary = paramOf(ct, "boundary");
+    if (!boundary) return;
+    for (const part of body.split("--" + boundary).slice(1)) {
+      if (part.startsWith("--")) break;
+      walkMime(part.replace(/^\r?\n/, ""), acc);
+    }
+    return;
+  }
+  const disp = (headers["content-disposition"] || [""])[0];
+  const filename = paramOf(disp, "filename") || paramOf(ct, "name");
+  if (filename) { acc.attachments.push(filename); return; }
+  if (type !== "text/plain" && type !== "text/html") return;
+  const enc = ((headers["content-transfer-encoding"] || [""])[0]).toLowerCase();
+  const charset = paramOf(ct, "charset");
+  let text = body;
+  try {
+    if (enc === "base64") text = decodeBytes(b64Bytes(body), charset);
+    else if (enc === "quoted-printable") text = decodeBytes(qpBytes(body, false), charset);
+  } catch (e) { /* marad a nyers szöveg */ }
+  (type === "text/html" ? acc.html : acc.text).push(text.trim());
+}
+function parseEml(raw) {
+  const { headers } = splitMessage(raw);
+  const h = (n) => decodeWords((headers[n] || [""])[0]);
+  const acc = { html: [], text: [], attachments: [] };
+  walkMime(raw, acc);
+  return {
+    sender: h("from"),
+    reply_to: h("reply-to"),
+    subject: h("subject"),
+    body: (acc.html.length ? acc.html : acc.text).join("\n\n"),
+    attachments: acc.attachments,
+  };
+}
+
+/* ------------------------------------------------------------ feltöltés */
+$("file").addEventListener("change", async (e) => {
+  const input = e.target;
+  const file = input.files[0];
+  if (!file) return;
+
+  if (file.size > 200 * 1024) {
+    showStatus("danger", el("strong", "", "Sikertelen feltöltés: "), "a fájl túl nagy (max. 200 KB).");
+    input.value = "";
+    return;
+  }
+
+  showStatus("info", "Feltöltés és elemzés folyamatban…");
+  input.disabled = true;
+  try {
+    let email;
+    try { email = parseEml(await file.text()); }
+    catch (err) { throw Object.assign(new Error("a fájl nem dolgozható fel (" + err.message + ")."), { parse: true }); }
+    if (!email.sender && !email.subject && !email.body) {
+      throw Object.assign(new Error("a fájlban nem található feladó, tárgy vagy levéltörzs – valószínűleg nem érvényes .eml."), { parse: true });
+    }
+
+    const doc = await callApi("/api/analyze", {
+      method: "POST",
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+      body: JSON.stringify(email),
+    });
+    detailsCache.set(doc.id, doc);
+    showStatus("success",
+      el("strong", "", "Sikeres feltöltés. "),
+      "Az elemzés eredménye mentve az adatbázisba (" + doc.riskScore + " pont, kockázat: " + doc.riskLevel + ").");
+    loadHistory();
+  } catch (err) {
+    if (err.data && err.data.result) {            // az elemzés lefutott, de a mentés nem sikerült
+      const r = err.data.result;
+      showStatus("warning",
+        el("strong", "", "Az elemzés lefutott, de nem sikerült az adatbázisba menteni. "),
+        "(" + r.riskScore + " pont, kockázat: " + r.riskLevel + ") A korábbi elemzések között ezért nem jelenik meg.");
+    } else {
+      showStatus("danger", el("strong", "", "Sikertelen feltöltés: "), err.message);
+    }
+  } finally {
+    input.disabled = false;
+    input.value = "";
+  }
+});
+
+/* -------------------------------------------------------- korábbi elemzések */
+function findingsList(doc) {
+  if (!doc.findings || !doc.findings.length) return el("div", "text-muted", "Nem található gyanús jellemző.");
+  const list = el("ul", "list-group");
+  for (const f of [...doc.findings].sort((a, b) => b.points - a.points)) {
+    const li = el("li", "list-group-item d-flex justify-content-between align-items-start");
+    const text = el("div", "");
+    text.append(el("div", "", f.description));
+    if (f.evidence) text.append(el("code", "small text-break", f.evidence));
+    li.append(text, el("span", "badge text-bg-secondary ms-2", "+" + f.points));
+    list.append(li);
+  }
+  return list;
+}
+
+async function toggleDetails(tr, it) {
+  const next = tr.nextElementSibling;
+  if (next && next.dataset.detailsFor === it.id) { next.remove(); return; }
+  document.querySelectorAll("tr[data-details-for]").forEach((n) => n.remove());
+
+  const cell = el("td", "bg-body-tertiary");
+  cell.colSpan = 5;
+  const row = el("tr", "");
+  row.dataset.detailsFor = it.id;
+  row.append(cell);
+  tr.after(row);
+  cell.textContent = "Betöltés…";
+  try {
+    let doc = detailsCache.get(it.id);
+    if (!doc) { doc = await callApi("/api/analyses/" + encodeURIComponent(it.id)); detailsCache.set(it.id, doc); }
+    cell.replaceChildren(findingsList(doc));
+  } catch (err) {
+    cell.replaceChildren(el("span", "text-danger", err.message));
+  }
+}
+
+async function loadHistory() {
+  const body = $("history");
+  try {
+    const data = await callApi("/api/analyses?limit=20");
+    if (!data.items.length) {
+      body.replaceChildren(el("tr", "", Object.assign(el("td", "text-muted", "Még nincs mentett elemzés."), { colSpan: 5 })));
+      return;
+    }
+    body.replaceChildren(...data.items.map((it) => {
+      const tr = el("tr", "");
+      tr.style.cursor = "pointer";
+      tr.tabIndex = 0;
+      tr.append(
+        el("td", "text-nowrap", new Date(it.analyzedAt).toLocaleString("hu-HU")),
+        el("td", "text-break", it.sender || "–"),
+        el("td", "text-break", it.subject || "–"),
+        el("td", "", String(it.riskScore)),
+        el("td", "", el("span", "badge " + (BADGE[it.riskLevel] || "text-bg-secondary"), it.riskLevel)));
+      tr.addEventListener("click", () => toggleDetails(tr, it));
+      tr.addEventListener("keydown", (ev) => { if (ev.key === "Enter") toggleDetails(tr, it); });
+      return tr;
+    }));
+  } catch (err) {
+    body.replaceChildren(el("tr", "", Object.assign(el("td", "text-danger", "A lista nem tölthető be: " + err.message), { colSpan: 5 })));
+  }
+}
+$("refresh").addEventListener("click", loadHistory);
+loadHistory();
+</script>
+</body>
+</html>
